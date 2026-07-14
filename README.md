@@ -143,3 +143,72 @@ O CI usa o código para distinguir o tipo de falha:
 ```bash
 pytest
 ```
+
+## Execução automática (GitHub Actions)
+
+O workflow [.github/workflows/daily.yml](.github/workflows/daily.yml) roda a coleta todo dia
+às **06:00 de São Paulo** (`cron: '0 9 * * *'` — o cron do GitHub é sempre em UTC, e o Brasil
+está fixo em UTC-3). Ele também aceita disparo manual.
+
+### 1. Cadastrar os Secrets
+
+No GitHub: **Settings → Secrets and variables → Actions → aba _Secrets_ → New repository secret**.
+Crie um por vez, com o nome EXATAMENTE como abaixo (maiúsculas, sem espaços):
+
+| Secret | Onde obter |
+| --- | --- |
+| `META_APP_ID` | developers.facebook.com → seu app → Configurações → Básico → *ID do aplicativo*. |
+| `META_APP_SECRET` | Mesma tela → *Chave secreta do aplicativo* → "Mostrar". |
+| `META_ACCESS_TOKEN` | Token de longa duração com permissão `ads_read`. |
+| `META_AD_ACCOUNT_ID` | Gerenciador de Anúncios → ID da conta, **com o prefixo `act_`** (ex.: `act_1234567890`). |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | O **conteúdo inteiro** do JSON da service account (cole o arquivo todo, incluindo as chaves `{ }`). Base64 também funciona. |
+| `SPREADSHEET_ID` | O trecho da URL da planilha entre `/d/` e `/edit`. |
+
+Depois de salvo, o valor de um Secret **não pode mais ser lido** — nem por você, nem nos logs.
+Para trocar, sobrescreva.
+
+Duas armadilhas comuns:
+
+- **Colar o JSON com quebras de linha é OK**, mas não deixe espaços antes do `{` ou depois do `}`.
+- A planilha precisa estar **compartilhada como Editor** com o e-mail da service account (o campo
+  `client_email` do JSON). Sem isso, o job falha com erro 403 dizendo exatamente isso.
+
+### 2. Comece por um disparo manual
+
+**Não confie no agendamento antes de ver o workflow rodar.** Vá em **Actions → "Coleta diária
+Meta ADS" → Run workflow**. O formulário abre com:
+
+- **`dry_run`**: deixe **marcado** (`true`) na primeira vez. A coleta na Meta acontece de verdade,
+  mas nada é escrito na planilha.
+- **`lookback_days`**: use `1` para o primeiro teste.
+- **`log_level`**: use `DEBUG` para ver as páginas da API sendo lidas.
+
+Se o ensaio passar, repita com `dry_run` **desmarcado** e `lookback_days = 1`, e confira a aba.
+Rode uma terceira vez com os mesmos parâmetros: o log deve mostrar `appended: 0` e todos os
+registros como `updated` — é a prova de que o upsert não duplica. Só então deixe o cron assumir.
+
+No agendamento diário, os inputs não existem e valem os defaults de produção: `DRY_RUN=false`,
+`LOOKBACK_DAYS=7`, `LOG_LEVEL=INFO`.
+
+### 3. Ler os logs de uma execução
+
+Em **Actions**, clique na execução → job **coleta** → passo **"Rodar a coleta"**. Os logs são
+JSON, uma linha por evento. Os campos que importam:
+
+```json
+{"level":"INFO","message":"Janela de coleta definida","since":"2026-07-07","until":"2026-07-13"}
+{"level":"INFO","message":"Coleta de insights concluída","pages":3,"records":412}
+{"level":"INFO","message":"Upsert planejado","to_update":380,"to_append":32}
+{"level":"INFO","message":"Upsert concluído","updated":380,"appended":32}
+{"level":"INFO","message":"Checagem 'chaves_unicas': OK","detail":"412 chaves únicas..."}
+```
+
+O mesmo log fica anexado como **artifact** (`logs-<run_id>-<tentativa>`, retido por 30 dias),
+baixável no topo da página da execução — inclusive quando o job falha, que é justamente quando
+ele interessa.
+
+Se o job ficar vermelho, o **código de saída** diz o tipo da falha (tabela acima): `1` é variável
+de ambiente faltando (Secret não cadastrado ou com nome errado), `2` é Meta ou Sheets recusando
+(token expirado, planilha não compartilhada), `3` é a validação reprovando (a gravação saiu
+inconsistente). Nenhum segredo aparece nos logs: o código não os imprime, e o Actions ainda
+mascara qualquer valor de Secret que vaze para a saída.

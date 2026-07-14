@@ -1,0 +1,90 @@
+name: Coleta diária Meta ADS
+
+on:
+  schedule:
+    # O cron do GitHub Actions é SEMPRE em UTC — não existe configuração de fuso.
+    # 09:00 UTC = 06:00 em São Paulo (UTC-3). O Brasil não adota mais horário de
+    # verão desde 2019, então o offset é fixo o ano inteiro; se voltar a adotar,
+    # este horário vira 07:00 local no verão e precisa virar '0 8 * * *'.
+    # O agendamento do GitHub não é pontual: a execução costuma atrasar alguns
+    # minutos (mais em horário de pico). Como a janela vai só até ontem, atraso
+    # não afeta o resultado.
+    - cron: '0 9 * * *'
+
+  # Disparo manual, para testar antes de confiar no agendamento.
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Ensaio: coleta de verdade, mas não escreve na planilha'
+        type: boolean
+        default: true
+      lookback_days:
+        description: 'Quantos dias retroativos coletar'
+        type: string
+        default: '7'
+      log_level:
+        description: 'Nível de log'
+        type: choice
+        options: [INFO, DEBUG, WARNING, ERROR]
+        default: INFO
+
+# Duas execuções simultâneas fariam upsert na mesma aba ao mesmo tempo.
+concurrency:
+  group: coleta-meta-ads
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  coleta:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurar Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Instalar dependências
+        run: pip install -r requirements.txt
+
+      - name: Rodar a coleta
+        env:
+          # Os segredos vêm dos GitHub Secrets. Eles NUNCA são impressos: o código
+          # não loga credenciais, e o Actions ainda mascara qualquer valor de secret
+          # que porventura apareça na saída. Não use `set -x` nem `env` aqui.
+          META_APP_ID: ${{ secrets.META_APP_ID }}
+          META_APP_SECRET: ${{ secrets.META_APP_SECRET }}
+          META_ACCESS_TOKEN: ${{ secrets.META_ACCESS_TOKEN }}
+          META_AD_ACCOUNT_ID: ${{ secrets.META_AD_ACCOUNT_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+
+          # No agendamento, os inputs vêm vazios: caem nos defaults de produção.
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+          LOOKBACK_DAYS: ${{ inputs.lookback_days || '7' }}
+          LOG_LEVEL: ${{ inputs.log_level || 'INFO' }}
+          ACCOUNT_TIMEZONE: America/Sao_Paulo
+        run: |
+          # pipefail: sem isso, o `tee` mascararia a falha do Python e o job
+          # passaria como verde mesmo com a coleta quebrada.
+          set -o pipefail
+          mkdir -p logs
+          python -m src.main 2>&1 | tee "logs/run-${{ github.run_id }}.log"
+
+      - name: Publicar os logs
+        # `always()`: o log da execução que FALHOU é justamente o que interessa.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: logs/
+          retention-days: 30
+          if-no-files-found: warn
