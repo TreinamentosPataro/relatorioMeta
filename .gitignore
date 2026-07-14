@@ -1,0 +1,30 @@
+# Segredos e credenciais
+.env
+.env.*
+!.env.example
+*.json
+!package.json
+!tsconfig.json
+credentials/
+service-account*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Ambientes virtuais
+.venv/
+venv/
+env/
+
+# IDE / SO
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

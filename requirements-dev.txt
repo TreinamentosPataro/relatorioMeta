@@ -1,0 +1,3 @@
+# Dependências de desenvolvimento/CI. Runtime fica em requirements.txt.
+-r requirements.txt
+pytest
