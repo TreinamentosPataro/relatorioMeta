@@ -212,3 +212,86 @@ de ambiente faltando (Secret não cadastrado ou com nome errado), `2` é Meta ou
 (token expirado, planilha não compartilhada), `3` é a validação reprovando (a gravação saiu
 inconsistente). Nenhum segredo aparece nos logs: o código não os imprime, e o Actions ainda
 mascara qualquer valor de Secret que vaze para a saída.
+
+## Garantias de qualidade
+
+Estas propriedades são mantidas por construção e cobertas por testes. Elas são o que permite
+rodar a automação diariamente sem vigilância:
+
+| Garantia | Como é sustentada |
+| --- | --- |
+| **Chave única (Date, Ad ID)** | A identidade de cada linha é o par `(coluna A, coluna J)`. O upsert usa essa chave para decidir entre atualizar e inserir; a validação pós-gravação relê a aba e reprova se qualquer chave aparecer duas vezes. |
+| **Sem duplicatas** | Antes de escrever, o lote é deduplicado pela chave (a última linha vence). A data é lida como número de série (locale-independente) para a chave casar mesmo com a planilha em pt-BR — sem isso, cada dia viraria append e a aba incharia. |
+| **Nunca altera outras abas** | Todo range de escrita é qualificado com o nome da aba (`'Meta ADS'!...`). A aba bruta só recebe `values.append`/`values.batchUpdate`; a derivada tem o `sheetId` resolvido em runtime. Não há nenhuma chamada de `delete`, `clear` ou reordenação sobre a aba bruta, e a linha 1 (cabeçalho) é inalcançável porque a leitura e a escrita começam na linha 2. |
+| **Upsert idempotente** | Rodar duas vezes a mesma janela produz o mesmo estado: a segunda execução atualiza as linhas no lugar (`appended: 0`). Reprocessar não cria histórico novo. |
+| **Janela móvel de reprocessamento** | A cada execução, coleta-se de `hoje - LOOKBACK_DAYS` até *ontem*. Os últimos dias são reescritos sobre si mesmos, então correções tardias da Meta (atribuição, conversões que chegam com atraso) entram na planilha sem duplicar. O dia corrente nunca é coletado — ele ainda está aberto e mudaria depois. |
+| **A aba derivada nunca destrói dados** | Ela é 100% recalculada a cada execução (valores, não fórmulas frágeis). Uma guarda impede que `DERIVED_SHEET_NAME` aponte para `RAW_SHEET_NAME`, o que apagaria o histórico bruto. |
+| **Falha barulhenta, nunca silenciosa** | Erros viram código de saída ≠ 0 (o CI acusa). Um `extra` de log mal escolhido é renomeado em vez de derrubar o job, e o `pipefail` no workflow impede que a coleta quebrada passe como verde. |
+
+## Como manter e expandir
+
+### Trocar ou adicionar uma conta de anúncios
+
+A conta é lida de `META_AD_ACCOUNT_ID` (com o prefixo `act_`). Para **trocar** a conta, basta
+mudar o Secret no GitHub — nada no código muda.
+
+Para coletar de **várias contas** na mesma planilha, o desenho atual roda uma conta por execução.
+O caminho recomendado é rodar o workflow uma vez por conta, cada uma escrevendo em sua própria
+planilha (ou aba), em vez de misturar contas na mesma aba — os nomes de campanha/conjunto se
+repetem entre contas e a chave `(Date, Ad ID)` só é única dentro de uma conta. Na prática:
+duplique o job no `daily.yml` com outro conjunto de Secrets e outro `SPREADSHEET_ID`.
+
+### Adicionar uma métrica na aba derivada
+
+Tudo acontece em [src/derived.py](src/derived.py), sem tocar na coleta nem na aba bruta:
+
+1. Acrescente o nome da coluna ao final de `HEADER` (mantenha a ordem = ordem de escrita).
+2. Em `_to_derived_row`, adicione o cálculo na posição correspondente. Use `_safe_div` para
+   **toda** divisão — denominador zero devolve `0`, nunca explode.
+3. Se a métrica for percentual ou monetária, inclua o índice (0-based) da nova coluna em
+   `_PERCENT_COLUMNS` ou `_MONEY_COLUMNS` para o number format ser aplicado.
+4. A guarda de contagem (`COLUMN_COUNT`) vai falar se `HEADER` e a linha saírem de sincronia.
+5. Escreva o teste em [tests/test_derived.py](tests/test_derived.py) — há exemplos de cálculo e
+   de divisão protegida para copiar.
+
+> **ROAS** não existe de propósito: teríamos só a *contagem* de compras (Omni Purchases), não o
+> valor. Calcular ROAS exige coletar `action_values` (com `action_type` `omni_purchase`) no
+> [src/meta_client.py](src/meta_client.py) e propagar pelo `transform` — não é uma mudança só na
+> aba derivada.
+
+### Adicionar um campo vindo da Meta
+
+1. Inclua o campo em `INSIGHT_FIELDS` ([src/meta_client.py](src/meta_client.py)).
+2. Mapeie-o para uma coluna em `to_rows` ([src/transform.py](src/transform.py)) e atualize
+   `COLUMNS` — a aba bruta tem 25 colunas fixas; mudar isso é uma mudança de schema da planilha.
+3. Atualize os testes de `transform`.
+
+### Mudar a janela de coleta (`LOOKBACK_DAYS`)
+
+É só configuração: mude o Secret/variável `LOOKBACK_DAYS`. Ele controla quantos dias retroativos
+são reescritos a cada execução (default `7`). Aumentar reprocessa mais histórico por dia (útil se
+a Meta ajusta conversões com semanas de atraso); o custo é mais linhas lidas/escritas por
+execução. O limite superior prático é a janela de retenção da sua conta na Marketing API.
+No `daily.yml`, o disparo manual permite sobrescrever `lookback_days` por execução.
+
+## Checklist de segurança
+
+- [x] **Nenhum segredo no código.** Toda credencial vem de variável de ambiente, lida só em
+      [src/config.py](src/config.py). Não há tokens, chaves ou IDs de conta embutidos.
+- [x] **Nenhum segredo no histórico do git.** Verificado com `git log --all -p` contra padrões de
+      chave privada, token da Meta (`EAA…`) e `client_secret`/`private_key` — sem ocorrências.
+- [x] **`.gitignore` cobre o que não pode vazar:** `.env`, `*.json` (credenciais), `.venv`,
+      caches. Só o `.env.example` (sem valores) é versionado.
+- [x] **Segredos do CI ficam em GitHub Secrets**, injetados como `env` apenas no passo que
+      executa. Uma vez salvos, não podem ser relidos.
+- [x] **Logs não imprimem credenciais.** O código nunca loga valores de Secret; não há `set -x`
+      nem `env` no workflow; e o Actions mascara qualquer valor de Secret que apareça na saída.
+- [x] **Escopo mínimo no Google:** a service account usa só `spreadsheets`, e precisa de acesso
+      apenas à planilha de destino (compartilhada como Editor).
+
+Para reauditar a qualquer momento:
+
+```bash
+git ls-files | grep -iE '\.env$|\.json$|secret|credential'   # deve retornar vazio
+git log --all -p | grep -iE 'private_key|EAA[A-Za-z0-9]{30}|client_secret'   # idem
+```

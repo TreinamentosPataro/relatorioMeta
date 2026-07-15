@@ -272,3 +272,64 @@ def test_erro_403_pede_compartilhar_como_editor() -> None:
 
     with pytest.raises(SheetPermissionError, match="Editor"):
         writer.upsert([make_row("2026-07-13", "ad1")])
+
+
+def _http_error(status: int) -> Any:
+    from googleapiclient.errors import HttpError
+
+    resp = type("R", (), {"status": status, "reason": "x"})()
+    return HttpError(resp, b'{"error": {"message": "erro"}}')
+
+
+def test_classificacao_de_erros_http() -> None:
+    """Cada status vira a exceção certa, com a mensagem certa."""
+    from src.sheet_writer import (
+        SheetRetryableError,
+        SheetWriterError,
+        classify_http_error,
+    )
+
+    email = "bot@x.iam.gserviceaccount.com"
+
+    assert isinstance(
+        classify_http_error(_http_error(401), "get", "sid", email), SheetPermissionError
+    )
+    assert isinstance(
+        classify_http_error(_http_error(403), "get", "sid", email), SheetPermissionError
+    )
+    for status in (429, 500, 502, 503, 504):
+        exc = classify_http_error(_http_error(status), "get", "sid", email)
+        assert isinstance(exc, SheetRetryableError), f"{status} deveria ser retryable"
+
+    nao_encontrada = classify_http_error(_http_error(404), "get", "sid", email)
+    assert isinstance(nao_encontrada, SheetWriterError)
+    assert "SPREADSHEET_ID" in str(nao_encontrada)
+
+
+def test_rate_limit_persistente_acaba_levantando(monkeypatch: pytest.MonkeyPatch) -> None:
+    """429 em toda tentativa: após esgotar o retry, a exceção sobe (job falha)."""
+    from src.sheet_writer import SheetRetryableError
+
+    values = FakeValues(error=_http_error(429))
+    writer = make_writer(values)
+    # Neutraliza a espera do backoff para o teste rodar instantâneo.
+    monkeypatch.setattr(writer._get_values.retry, "sleep", lambda _s: None)
+
+    with pytest.raises(SheetRetryableError, match="temporário"):
+        writer.upsert([make_row("2026-07-13", "ad1")])
+
+    assert len(values.get_calls) >= 2, "tem de ter retentado antes de desistir"
+
+
+def test_updates_sao_enviados_em_lotes() -> None:
+    """Mais de 200 updates viram mais de um batchUpdate (limite de escrita)."""
+    existing = [[46216] + [""] * 8 + [f"ad{i}"] for i in range(250)]
+    values = FakeValues(existing)
+    writer = make_writer(values)
+
+    rows = [make_row("2026-07-13", f"ad{i}") for i in range(250)]
+    summary = writer.upsert(rows)
+
+    assert summary.updated == 250
+    assert len(values.batch_updates) == 2, "250 updates em lotes de 200 = 2 chamadas"
+    assert values.appends == []

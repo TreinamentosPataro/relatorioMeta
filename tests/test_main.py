@@ -197,6 +197,24 @@ def test_falha_de_validacao_devolve_codigo_proprio(monkeypatch: pytest.MonkeyPat
     assert main_module.main_with_config(make_config()) == EXIT_VALIDATION
 
 
+def test_falha_de_thumbnail_nao_derruba_a_coleta(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Rate limit nas thumbnails: segue sem elas em vez de perder o dia todo."""
+    from src.meta_client import MetaRetryableError
+
+    install_fakes(monkeypatch)
+
+    def explode(self: Any, ad_ids: list[str]) -> dict[str, str | None]:
+        raise MetaRetryableError("rate limit persistente")
+
+    monkeypatch.setattr(FakeMetaClient, "get_thumbnails", explode)
+
+    assert run(make_config()) == EXIT_OK
+
+    writer = FakeSheetWriter.instances[0]
+    assert len(writer.upserted) == 1
+    assert writer.upserted[0][10] == "", "sem thumbnail, coluna K fica vazia"
+
+
 def test_erro_de_auth_na_meta_devolve_codigo_de_api(monkeypatch: pytest.MonkeyPatch) -> None:
     install_fakes(monkeypatch)
 

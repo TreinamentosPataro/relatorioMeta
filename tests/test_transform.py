@@ -227,3 +227,57 @@ def test_spend_invalido_ou_ausente_vira_zero(valor: Any) -> None:
     row = to_rows([build_insight(spend=valor)])[0]
 
     assert row[11] == 0.0
+
+
+def test_action_type_repetido_e_somado() -> None:
+    """A API normalmente traz um tipo por entrada, mas se repetir, somamos."""
+    insight = build_insight(
+        actions=[
+            {"action_type": "lead", "value": "3"},
+            {"action_type": "lead", "value": "4"},
+        ]
+    )
+    row = to_rows([insight])[0]
+
+    assert row[15] == 7  # P Leads = 3 + 4
+
+
+def test_actions_malformado_nao_explode() -> None:
+    """actions vindo como None, dict ou string não pode derrubar a normalização."""
+    for actions in (None, {"nao": "e-lista"}, "texto", 123):
+        row = to_rows([build_insight(actions=actions)])[0]
+        for index in (13, 14, 15, 18, 23, 24):
+            assert row[index] == 0
+
+
+def test_video_field_malformado_vira_zero() -> None:
+    """Campo de vídeo com formato inesperado soma 0, sem erro."""
+    insight = build_insight(video_play_actions="nao-e-lista")
+    row = to_rows([insight])[0]
+
+    assert row[16] == 0  # Q
+
+
+def test_entrada_de_action_sem_value_vira_zero() -> None:
+    """Entrada de action sem o campo 'value' conta como 0, não quebra."""
+    insight = build_insight(actions=[{"action_type": "lead"}])
+    row = to_rows([insight])[0]
+
+    assert row[15] == 0
+
+
+def test_ordem_de_multiplos_registros_e_preservada() -> None:
+    """A ordem de saída acompanha a ordem de entrada (importa para o append)."""
+    rows = to_rows(
+        [
+            build_insight(ad_id="ad1", date_start="2026-07-12"),
+            build_insight(ad_id="ad2", date_start="2026-07-12"),
+            build_insight(ad_id="ad1", date_start="2026-07-13"),
+        ]
+    )
+
+    assert [(r[0], r[9]) for r in rows] == [
+        ("2026-07-12", "ad1"),
+        ("2026-07-12", "ad2"),
+        ("2026-07-13", "ad1"),
+    ]

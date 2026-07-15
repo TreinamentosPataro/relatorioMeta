@@ -64,8 +64,18 @@ def run(config: Config) -> int:
         )
         return EXIT_OK
 
+    # A thumbnail é só a coluna K; não vale perder o dia inteiro de insights se a
+    # busca de criativos falhar (rate limit persistente, criativo inacessível).
+    # Best-effort: sem thumbnail, a coluna sai vazia e o resto segue.
     ad_ids = [str(row["ad_id"]) for row in insights if row.get("ad_id")]
-    thumbnails = client.get_thumbnails(ad_ids)
+    try:
+        thumbnails = client.get_thumbnails(ad_ids)
+    except MetaClientError as exc:
+        logger.warning(
+            "Não foi possível buscar as thumbnails; seguindo sem elas.",
+            extra={"error": str(exc), "ads": len(ad_ids)},
+        )
+        thumbnails = {}
 
     # 5. Normalização para as 25 colunas da aba bruta.
     rows = to_rows(insights, thumbnails)
