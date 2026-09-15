@@ -1,0 +1,89 @@
+name: Keepalive (impedir desativação do cron)
+
+# POR QUE ISSO EXISTE
+# O GitHub desativa automaticamente workflows agendados (`schedule`) quando o
+# repositório fica 60 dias sem atividade. Como a coleta diária roda sozinha e
+# ninguém commita aqui com frequência, o cron de daily.yml morre sozinho.
+# Este workflow faz um commit vazio periódico: atividade suficiente para
+# zerar o contador dos 60 dias.
+
+on:
+  schedule:
+    # Dias 1 e 16 de cada mês, 07:17 UTC (04:17 em São Paulo).
+    # ~15 dias de intervalo, com folga enorme contra o limite de 60.
+    # Minuto quebrado de propósito: agendamentos "na hora cheia" entram na fila
+    # de pico do GitHub e atrasam mais. Atraso aqui é irrelevante, mas não custa.
+    - cron: '17 7 1,16 * *'
+
+  # Para testar sem esperar o dia 1.
+  workflow_dispatch:
+    inputs:
+      forcar:
+        description: 'Commitar mesmo que o repo tenha atividade recente'
+        type: boolean
+        default: false
+
+# Precisa de escrita no repositório para dar push do commit vazio.
+# `actions: write` é para reabilitar o daily.yml caso ele já tenha sido desativado.
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: keepalive
+  cancel-in-progress: false
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Em forks o push falharia e o e-mail de erro seria só ruído.
+    if: github.repository == 'TreinamentosPataro/relatorioMeta'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        # O checkout já deixa o GITHUB_TOKEN gravado no .git/config, então o
+        # `git push` mais abaixo funciona sem configurar credencial nenhuma.
+
+      - name: Verificar se o commit é mesmo necessário
+        id: check
+        run: |
+          set -euo pipefail
+          ultimo=$(git log -1 --format=%ct)
+          agora=$(date +%s)
+          dias=$(( (agora - ultimo) / 86400 ))
+          echo "Último commit foi há ${dias} dia(s)."
+
+          # Só commita se o repo estiver realmente parado. Sem esta trava, o
+          # histórico encheria de commits vazios mesmo em período de trabalho.
+          # Com execução a cada ~15 dias e limite de 30, o intervalo máximo
+          # entre commits fica em ~45 dias — bem abaixo dos 60.
+          if [ "${{ inputs.forcar }}" = "true" ] || [ "$dias" -ge 30 ]; then
+            echo "precisa=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "precisa=false" >> "$GITHUB_OUTPUT"
+            echo "Atividade recente: nada a fazer."
+          fi
+
+      - name: Commit vazio para manter o repositório ativo
+        if: steps.check.outputs.precisa == 'true'
+        run: |
+          set -euo pipefail
+          # Identidade do bot do próprio Actions — o mesmo autor que aparece em
+          # qualquer commit feito por automação do GitHub.
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit --allow-empty -m 'chore: keepalive — manter o cron da coleta ativo'
+          git push
+          # Nota: push feito com GITHUB_TOKEN não dispara outros workflows.
+          # É proposital (evita loop) e não atrapalha: o que importa é a atividade.
+
+      - name: Reabilitar a coleta diária, se estiver desativada
+        # Rede de segurança: se o cron JÁ tinha sido desativado por inatividade,
+        # o commit acima sozinho não o reativa. `continue-on-error` porque
+        # habilitar algo que já está habilitado não é motivo para o job falhar.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow enable daily.yml --repo "${{ github.repository }}"
