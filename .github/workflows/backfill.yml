@@ -1,0 +1,79 @@
+name: Backfill da aba derivada
+
+# Execução avulsa, nunca agendada: reconstrói a aba "Meta ADS - Métricas" a partir
+# do histórico completo da aba bruta "Meta ADS". Só faz sentido rodar uma vez, para
+# recuperar o que as reconstruções antigas apagaram. Depois disso a coleta diária
+# mantém a aba em dia sozinha.
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Ensaio: lê a aba bruta e diz quantas linhas entrariam, sem escrever'
+        type: boolean
+        default: true
+      log_level:
+        description: 'Nível de log'
+        type: choice
+        options: [INFO, DEBUG, WARNING, ERROR]
+        default: INFO
+
+# O backfill e a coleta diária escrevem na mesma aba. Sem compartilhar o grupo de
+# concorrência com a coleta, os dois poderiam fazer upsert ao mesmo tempo, cada um
+# com um índice de chaves obsoleto, e duplicar linhas.
+concurrency:
+  group: coleta-meta-ads
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurar Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Instalar dependências
+        run: pip install -r requirements.txt
+
+      - name: Rodar o backfill
+        env:
+          # Mesmos segredos da coleta diária. Não use `set -x` nem `env` aqui.
+          META_APP_ID: ${{ secrets.META_APP_ID }}
+          META_APP_SECRET: ${{ secrets.META_APP_SECRET }}
+          META_ACCESS_TOKEN: ${{ secrets.META_ACCESS_TOKEN }}
+          META_AD_ACCOUNT_ID: ${{ secrets.META_AD_ACCOUNT_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+
+          # O backfill não fala com a Meta, mas load_config() exige as credenciais
+          # dela por serem obrigatórias no Config. LOOKBACK_DAYS é irrelevante aqui:
+          # a janela é o histórico inteiro da aba bruta.
+          DRY_RUN: ${{ inputs.dry_run }}
+          LOG_LEVEL: ${{ inputs.log_level }}
+          ACCOUNT_TIMEZONE: America/Sao_Paulo
+        run: |
+          # pipefail: sem isso, o `tee` mascararia a falha do Python e o job
+          # passaria como verde mesmo com o backfill quebrado.
+          set -o pipefail
+          mkdir -p logs
+          python -m src.backfill 2>&1 | tee "logs/backfill-${{ github.run_id }}.log"
+
+      - name: Publicar os logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-backfill-${{ github.run_id }}-${{ github.run_attempt }}
+          path: logs/
+          retention-days: 30
+          if-no-files-found: warn

@@ -158,6 +158,19 @@ def _col_index(letters: str) -> int:
     return index - 1
 
 
+def _sort_key(row: list[Any], specs: list[dict[str, Any]]) -> tuple[Any, ...]:
+    """Chave de ordenação equivalente à do Sheets: número antes de texto."""
+    chave: list[tuple[int, float, str]] = []
+    for spec in specs:
+        index = spec["dimensionIndex"]
+        valor = row[index] if index < len(row) else ""
+        if isinstance(valor, bool) or not isinstance(valor, (int, float)):
+            chave.append((1, 0.0, str(valor)))
+        else:
+            chave.append((0, float(valor), ""))
+    return tuple(chave)
+
+
 def derived_row(date: Any, ad_id: str, spend: float = 1.0) -> list[Any]:
     """Linha derivada de 22 colunas, como a que já mora na planilha."""
     row: list[Any] = [0] * 22
@@ -288,7 +301,18 @@ class FakeSpreadsheets:
                         }
                     }
                 )
+            if "sortRange" in request:  # reordena de verdade, para dar o que afirmar
+                self._sort(request["sortRange"])
         return FakeCall({})
+
+    def _sort(self, spec: dict[str, Any]) -> None:
+        """Reordena as linhas do intervalo, como o sortRange do Sheets faria."""
+        rng = spec["range"]
+        start, end = rng["startRowIndex"], rng["endRowIndex"]
+        grid = self._values.grid
+        bloco = grid[start:end]
+        bloco.sort(key=lambda row: _sort_key(row, spec["sortSpecs"]))
+        grid[start:end] = bloco
 
     def values(self) -> FakeValues:
         return self._values
@@ -501,8 +525,10 @@ def test_escreve_apenas_na_aba_derivada() -> None:
 
     for update in spreadsheets.batch_updates:
         for request in update["body"]["requests"]:
-            sheet_id = request["repeatCell"]["range"]["sheetId"]
-            assert sheet_id == 77, "formato aplicado fora da aba derivada"
+            spec = request.get("repeatCell") or request.get("sortRange")
+            assert spec is not None, f"request estrutural inesperado: {list(request)}"
+            sheet_id = spec["range"]["sheetId"]
+            assert sheet_id == 77, "request estrutural fora da aba derivada"
             assert sheet_id != 0, "jamais tocar no sheetId da aba bruta"
 
 
@@ -527,6 +553,8 @@ def test_formatos_cobrem_todo_o_historico_e_poupam_o_cabecalho() -> None:
     formatos: dict[int, str] = {}
     for update in spreadsheets.batch_updates:
         for request in update["body"]["requests"]:
+            if "repeatCell" not in request:
+                continue
             rng = request["repeatCell"]["range"]
             cell = request["repeatCell"]["cell"]
             formatos[rng["startColumnIndex"]] = cell["userEnteredFormat"]["numberFormat"][
@@ -541,6 +569,90 @@ def test_formatos_cobrem_todo_o_historico_e_poupam_o_cabecalho() -> None:
     assert formatos[17] == "0.00%"       # Video Completion
     assert formatos[5] == "#,##0.00"     # Spend
     assert formatos[19] == "#,##0.00"    # CPA
+
+
+# -- Ordem cronológica -----------------------------------------------------
+
+
+def _datas(values: FakeValues) -> list[Any]:
+    """Coluna A das linhas de dados, de cima para baixo."""
+    return [linha[0] for linha in values.grid[1:]]
+
+
+def test_linha_nova_de_data_antiga_cai_no_lugar_certo() -> None:
+    """O append joga no fim; a ordenação tem de trazer a linha para o meio."""
+    writer, _, values = make_writer(grid=populated_grid())
+
+    writer.upsert(
+        [make_raw(date="2026-01-02", ad_id="ad9", campaign="Campanha Velha")]
+    )
+
+    assert _datas(values) == ["2026-01-02", "2026-01-02", "2026-01-03", "2026-07-13"]
+    assert values.grid[2][4] == "ad9", "empate de data e campanha desempata por Ad ID"
+
+
+def test_aba_termina_em_ordem_cronologica() -> None:
+    writer, _, values = make_writer(grid=populated_grid())
+
+    writer.upsert(
+        [
+            make_raw(date="2026-03-05", ad_id="ad3", campaign="Campanha Velha"),
+            make_raw(date="2026-01-01", ad_id="ad4", campaign="Campanha Velha"),
+            make_raw(date="2026-12-31", ad_id="ad5", campaign="Campanha Velha"),
+        ]
+    )
+
+    datas = _datas(values)
+    assert datas == sorted(datas)
+    assert datas[0] == "2026-01-01" and datas[-1] == "2026-12-31"
+
+
+def test_ordenacao_nao_perde_nem_duplica_nenhuma_linha() -> None:
+    writer, _, values = make_writer(grid=populated_grid())
+
+    writer.upsert(
+        [
+            make_raw(date="2026-01-01", ad_id="ad4", campaign="Campanha Velha"),
+            make_raw(date="2026-02-02", ad_id="ad5", campaign="Campanha Velha"),
+        ]
+    )
+
+    chaves = [(linha[0], linha[4]) for linha in values.grid[1:]]
+    assert len(chaves) == 5, "3 do histórico + 2 novas"
+    assert len(set(chaves)) == 5, "a ordenação não pode duplicar chave"
+    assert ("2026-07-13", "ad1") in chaves, "a linha mais antiga continua lá"
+
+
+def test_cabecalho_nunca_entra_na_ordenacao() -> None:
+    writer, spreadsheets, values = make_writer(grid=populated_grid())
+
+    writer.upsert([make_raw(date="2026-01-01", ad_id="ad4")])
+
+    ordenacoes = [
+        request["sortRange"]
+        for update in spreadsheets.batch_updates
+        for request in update["body"]["requests"]
+        if "sortRange" in request
+    ]
+    assert len(ordenacoes) == 1, "uma ordenação por execução"
+    rng = ordenacoes[0]["range"]
+    assert rng["startRowIndex"] == 1, "a linha 1 é o cabeçalho e fica de fora"
+    assert (rng["startColumnIndex"], rng["endColumnIndex"]) == (0, 22), (
+        "ordenar um subconjunto de colunas embaralharia os dados entre as linhas"
+    )
+    assert values.grid[0] == list(HEADER), "o cabeçalho continua na linha 1"
+
+
+def test_ordenacao_vai_no_mesmo_batchupdate_dos_formatos() -> None:
+    """Não custa uma requisição a mais à API."""
+    writer, spreadsheets, _ = make_writer(grid=populated_grid())
+
+    writer.upsert([make_raw(date="2026-01-01", ad_id="ad4")])
+
+    assert len(spreadsheets.batch_updates) == 1
+    requests = spreadsheets.batch_updates[0]["body"]["requests"]
+    assert sum(1 for r in requests if "repeatCell" in r) == 12
+    assert sum(1 for r in requests if "sortRange" in r) == 1
 
 
 def test_dry_run_nao_toca_na_planilha() -> None:

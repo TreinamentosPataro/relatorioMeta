@@ -25,7 +25,18 @@ igual ao da aba bruta:
 
 Nenhuma operação deste módulo remove linhas. As únicas escritas são values.update
 (cabeçalho, linha 1), values.batchUpdate (linhas existentes, uma a uma, pelo número da
-linha) e values.append. Não há clear, deleteDimension, deleteRange nem deleteSheet.
+linha), values.append e um sortRange. Não há clear, deleteDimension, deleteRange nem
+deleteSheet.
+
+Ao fim de cada execução a aba é ORDENADA por Data (e, dentro do dia, por campanha e
+Ad ID). Como o append joga a linha nova no fim, sem ordenar a aba ficaria fora de ordem
+cronológica assim que um anúncio novo aparecesse numa data antiga. sortRange reordena as
+linhas de dados dentro do próprio intervalo A2:V — move linhas de lugar, nunca apaga
+nenhuma, e o cabeçalho fica de fora porque o range começa na linha 2.
+
+Consequência a conhecer: o número da linha de um registro MUDA entre execuções. Nada
+neste projeto depende disso (o índice de chaves é reconstruído a cada execução), mas
+fórmulas externas que apontem para linhas fixas desta aba não sobreviveriam.
 
 Os valores gravados são NÚMEROS, não fórmulas: fórmulas do tipo =Meta_ADS!L2/M2 quebram
 quando as linhas da aba bruta são reordenadas ou inseridas. Aqui, o número é calculado em
@@ -105,6 +116,9 @@ _RAW_MESSAGING: Final[int] = 24
 # Índices (0-based) na linha DERIVADA que formam a chave de upsert.
 _DERIVED_DATE: Final[int] = 0   # coluna A
 _DERIVED_AD_ID: Final[int] = 4  # coluna E
+
+# Critério de ordenação da aba: dia, depois campanha, depois anúncio.
+_DERIVED_CAMPAIGN: Final[int] = 1  # coluna B
 
 # Índices (0-based) na linha derivada, para os number formats.
 _PERCENT_COLUMNS: Final[tuple[int, ...]] = (8, 15, 16, 17)  # CTR, Hook, Hold, Completion
@@ -317,7 +331,7 @@ class DerivedSheetWriter:
         appended, append_last_row = self._apply_appends(appends)
         last_row = max(last_row, append_last_row)
 
-        self._apply_formats(sheet_id, last_row)
+        self._apply_layout(sheet_id, last_row)
 
         logger.info(
             "Upsert concluído na aba derivada",
@@ -580,11 +594,14 @@ class DerivedSheetWriter:
         except HttpError as exc:
             raise self._classify(exc, "values.append") from exc
 
-    def _apply_formats(self, sheet_id: int, last_row: int) -> None:
-        """Aplica os number formats (data, moeda, porcentagem) só na aba derivada.
+    def _apply_layout(self, sheet_id: int, last_row: int) -> None:
+        """Aplica number formats e ordena a aba por data, num único batchUpdate.
 
-        Cobre todas as linhas de dados, inclusive as históricas: repeatCell de
-        numberFormat muda apenas a APARÊNCIA da célula, nunca o conteúdo.
+        Os formats cobrem todas as linhas de dados, inclusive as históricas:
+        repeatCell de numberFormat muda apenas a APARÊNCIA da célula, nunca o
+        conteúdo. O sortRange vai junto na mesma chamada para não custar uma
+        requisição a mais — os formats são uniformes por coluna, então reordenar
+        as linhas depois de aplicá-los dá exatamente o mesmo resultado.
         """
         if last_row < _FIRST_DATA_ROW:
             return
@@ -600,10 +617,11 @@ class DerivedSheetWriter:
             _format_request(sheet_id, column, last_row, "NUMBER", _MONEY_FORMAT)
             for column in _MONEY_COLUMNS
         ]
+        requests.append(_sort_request(sheet_id, last_row))
 
         self._batch_update(requests)
         logger.info(
-            "Number formats aplicados na aba derivada",
+            "Formatos aplicados e aba ordenada por data",
             extra={
                 "sheet": self._sheet_name,
                 "sheet_id": sheet_id,
@@ -686,6 +704,31 @@ def _format_request(
                 }
             },
             "fields": "userEnteredFormat.numberFormat",
+        }
+    }
+
+
+def _sort_request(sheet_id: int, last_row: int) -> dict[str, Any]:
+    """Ordena as linhas de dados por Data, campanha e Ad ID.
+
+    O range cobre as 22 colunas inteiras, então a linha se move como um bloco —
+    ordenar um subconjunto de colunas embaralharia os dados entre as linhas. E
+    começa na linha 2, então o cabeçalho nunca entra na ordenação.
+    """
+    return {
+        "sortRange": {
+            "range": {
+                "sheetId": sheet_id,  # sempre a aba derivada
+                "startRowIndex": _FIRST_DATA_ROW - 1,
+                "endRowIndex": last_row,
+                "startColumnIndex": 0,
+                "endColumnIndex": COLUMN_COUNT,
+            },
+            "sortSpecs": [
+                {"dimensionIndex": _DERIVED_DATE, "sortOrder": "ASCENDING"},
+                {"dimensionIndex": _DERIVED_CAMPAIGN, "sortOrder": "ASCENDING"},
+                {"dimensionIndex": _DERIVED_AD_ID, "sortOrder": "ASCENDING"},
+            ],
         }
     }
 
