@@ -29,9 +29,10 @@ SheetWriter.write()           -> aba bruta + aba de métricas
 | `src/meta_client.py` | Acesso à Marketing API (paginação, retries). |
 | `src/transform.py` | Resposta da API → linhas da planilha. |
 | `src/validate.py` | Checagem de schema e consistência antes de escrever. |
-| `src/derived.py` | Cálculo das métricas derivadas. |
+| `src/derived.py` | Cálculo das métricas derivadas e upsert na aba derivada. |
 | `src/sheet_writer.py` | Escrita nas abas do Google Sheets (respeita `DRY_RUN`). |
 | `src/main.py` | Ponto de entrada; orquestra o pipeline. |
+| `src/backfill.py` | Execução avulsa: reconstrói a aba derivada a partir da aba bruta. |
 
 Nenhuma credencial vive no código: tudo vem de variáveis de ambiente, carregadas de um `.env`
 local em desenvolvimento e de secrets no CI.
@@ -190,7 +191,28 @@ registros como `updated` — é a prova de que o upsert não duplica. Só então
 No agendamento diário, os inputs não existem e valem os defaults de produção: `DRY_RUN=false`,
 `LOOKBACK_DAYS=7`, `LOG_LEVEL=INFO`.
 
-### 3. Ler os logs de uma execução
+> ⚠️ O `dry_run` vem **marcado** por padrão no disparo manual. Se você rodar e o log disser
+> `DRY_RUN ativo: nada foi escrito na planilha.`, foi só isso: rode de novo desmarcando.
+
+### 3. Recuperar o histórico da aba derivada (uma vez só)
+
+Antes da mudança para upsert, a aba derivada era reconstruída a cada execução, então só
+sobrevivia nela a janela de `LOOKBACK_DAYS`. A aba **bruta** sempre foi upsert e tem o
+histórico inteiro — o backfill reconstrói a derivada a partir dela, sem falar com a Meta.
+
+Vá em **Actions → "Backfill da aba derivada" → Run workflow**:
+
+1. Rode com `dry_run` **marcado**. O log mostra `rows_usable` (quantas linhas a aba bruta
+   tem) e `would_write_rows`.
+2. Repita com `dry_run` **desmarcado**. O log traz `updated` + `appended`; a soma deve bater
+   com `rows_usable`.
+3. Rode uma terceira vez, se quiser a prova: agora deve ser `appended: 0` e tudo `updated`.
+
+Depois disso a coleta diária mantém a aba em dia sozinha, e o backfill não precisa mais ser
+executado. Ele compartilha o grupo de concorrência com a coleta, então os dois nunca escrevem
+na mesma aba ao mesmo tempo.
+
+### 4. Ler os logs de uma execução
 
 Em **Actions**, clique na execução → job **coleta** → passo **"Rodar a coleta"**. Os logs são
 JSON, uma linha por evento. Os campos que importam:
@@ -226,6 +248,7 @@ rodar a automação diariamente sem vigilância:
 | **Upsert idempotente** | Rodar duas vezes a mesma janela produz o mesmo estado: a segunda execução atualiza as linhas no lugar (`appended: 0`). Reprocessar não cria histórico novo. |
 | **Janela móvel de reprocessamento** | A cada execução, coleta-se de `hoje - LOOKBACK_DAYS` até *ontem*. Os últimos dias são reescritos sobre si mesmos, então correções tardias da Meta (atribuição, conversões que chegam com atraso) entram na planilha sem duplicar. O dia corrente nunca é coletado — ele ainda está aberto e mudaria depois. |
 | **A aba derivada nunca destrói dados** | Ela também é escrita por **upsert**, com a chave `(coluna A, coluna E)` — nunca é limpa. Os valores gravados são números (não fórmulas frágeis), recalculados só para a janela coletada; as linhas fora dela não são tocadas, porque o histórico completo alimenta o dashboard. Uma guarda impede que `DERIVED_SHEET_NAME` aponte para `RAW_SHEET_NAME`, o que sobrescreveria o histórico bruto. |
+| **A aba derivada fica em ordem cronológica** | Como o append joga a linha nova no fim, ao término de cada execução um `sortRange` reordena as linhas de dados por Data, campanha e Ad ID. O range cobre `A2:V` inteiro, então a linha se move como um bloco e o cabeçalho fica de fora. Ordenar move linhas de lugar, nunca apaga nenhuma — mas o número da linha de um registro **muda entre execuções**, então não aponte fórmulas externas para linhas fixas dessa aba. |
 | **Falha barulhenta, nunca silenciosa** | Erros viram código de saída ≠ 0 (o CI acusa). Um `extra` de log mal escolhido é renomeado em vez de derrubar o job, e o `pipefail` no workflow impede que a coleta quebrada passe como verde. |
 
 ## Como manter e expandir
