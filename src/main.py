@@ -84,9 +84,11 @@ def run(config: Config) -> int:
     writer = SheetWriter(config)
     write_summary = writer.upsert(rows)
 
-    # 7. Reconstrução da aba derivada (não escreve em DRY_RUN).
+    # 7. Upsert na aba derivada (não escreve em DRY_RUN).
+    # Upsert, e não reconstrução: a aba derivada guarda o histórico completo que o
+    # dashboard consome; limpá-la apagaria tudo que está fora da janela de coleta.
     derived_writer = DerivedSheetWriter(config, service=writer.service)
-    derived_summary = derived_writer.rebuild(rows)
+    derived_summary = derived_writer.upsert(rows)
 
     logger.info(
         "Gravação concluída",
@@ -95,6 +97,8 @@ def run(config: Config) -> int:
             "appended": write_summary.appended,
             "processed": write_summary.processed,
             "derived_rows": derived_summary.rows,
+            "derived_updated": derived_summary.updated,
+            "derived_appended": derived_summary.appended,
             "dry_run": config.dry_run,
         },
     )
