@@ -123,11 +123,11 @@ class FakeDerivedWriter:
     def __init__(self, config: Any, service: Any = None) -> None:
         self.config = config
         self.service = service
-        self.rebuilt: list[list[Any]] = []
+        self.upserted: list[list[Any]] = []
         FakeDerivedWriter.instances.append(self)
 
-    def rebuild(self, rows: list[list[Any]]) -> FakeSummary:
-        self.rebuilt = rows
+    def upsert(self, rows: list[list[Any]]) -> FakeSummary:
+        self.upserted = rows
         return FakeSummary()
 
 
@@ -160,7 +160,7 @@ def test_fluxo_completo_grava_e_valida(monkeypatch: pytest.MonkeyPatch) -> None:
     assert writer.read_calls == 1, "a validação precisa reler a aba"
 
     derived = FakeDerivedWriter.instances[0]
-    assert derived.rebuilt == writer.upserted
+    assert derived.upserted == writer.upserted
     assert derived.service is writer.service, "reusa o cliente autenticado"
 
 

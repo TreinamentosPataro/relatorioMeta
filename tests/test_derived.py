@@ -1,7 +1,8 @@
-"""Testes das métricas derivadas e da reconstrução da aba."""
+"""Testes das métricas derivadas e do upsert na aba derivada."""
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import pytest
@@ -139,7 +140,32 @@ def test_lista_vazia() -> None:
     assert build_derived_rows([]) == []
 
 
-# -- Escrita: só a aba derivada -------------------------------------------
+# -- Escrita: upsert, só na aba derivada, sem apagar histórico -------------
+
+DERIVED = "Meta ADS - Métricas"
+RAW = "Meta ADS"
+
+_RANGE = re.compile(
+    r"^'(?P<sheet>[^']*)'!(?P<c1>[A-Z]+)(?P<r1>[0-9]+)(?::(?P<c2>[A-Z]+)(?P<r2>[0-9]*))?$"
+)
+
+
+def _col_index(letters: str) -> int:
+    """'A' -> 0, 'E' -> 4, 'V' -> 21."""
+    index = 0
+    for char in letters:
+        index = index * 26 + (ord(char) - ord("A") + 1)
+    return index - 1
+
+
+def derived_row(date: Any, ad_id: str, spend: float = 1.0) -> list[Any]:
+    """Linha derivada de 22 colunas, como a que já mora na planilha."""
+    row: list[Any] = [0] * 22
+    row[0] = date
+    row[1] = "Campanha Velha"
+    row[4] = ad_id
+    row[5] = spend
+    return row
 
 
 class FakeCall:
@@ -151,17 +177,89 @@ class FakeCall:
 
 
 class FakeValues:
-    def __init__(self) -> None:
+    """Simula a aba de verdade: linha 1 é o cabeçalho, dados a partir da linha 2.
+
+    Guardar o conteúdo (e não só as chamadas) é o que permite afirmar que uma
+    linha histórica continuou byte a byte igual depois da execução.
+    """
+
+    def __init__(self, grid: list[list[Any]] | None = None) -> None:
+        self.grid: list[list[Any]] = [list(row) for row in (grid or [])]
         self.clears: list[dict[str, Any]] = []
         self.updates: list[dict[str, Any]] = []
+        self.batch_updates: list[dict[str, Any]] = []
+        self.appends: list[dict[str, Any]] = []
+
+    # -- helpers internos --
+
+    def _row(self, number: int) -> list[Any]:
+        while len(self.grid) < number:
+            self.grid.append([])
+        return self.grid[number - 1]
+
+    def _write(self, range_: str, values: list[list[Any]]) -> int:
+        parts = _RANGE.match(range_)
+        assert parts is not None, "range inesperado: " + range_
+        start_row = int(parts.group("r1"))
+        start_col = _col_index(parts.group("c1"))
+        for offset, row in enumerate(values):
+            target = self._row(start_row + offset)
+            while len(target) < start_col + len(row):
+                target.append("")
+            target[start_col : start_col + len(row)] = list(row)
+        return len(values)
+
+    def _last_filled_row(self) -> int:
+        for number in range(len(self.grid), 0, -1):
+            if any(str(cell).strip() for cell in self.grid[number - 1]):
+                return number
+        return 0
+
+    # -- API dublada --
 
     def clear(self, **kwargs: Any) -> FakeCall:
         self.clears.append(kwargs)
-        return FakeCall({})
+        raise AssertionError("A aba derivada jamais pode ser limpa.")
+
+    def get(self, **kwargs: Any) -> FakeCall:
+        parts = _RANGE.match(kwargs["range"])
+        assert parts is not None, "range inesperado: " + kwargs["range"]
+        start_row = int(parts.group("r1"))
+        end_row = int(parts.group("r2") or 0) or len(self.grid)
+        start_col = _col_index(parts.group("c1"))
+        end_col = _col_index(parts.group("c2") or parts.group("c1"))
+
+        rows: list[list[Any]] = []
+        for number in range(start_row, end_row + 1):
+            if number > len(self.grid):
+                break
+            rows.append(list(self.grid[number - 1][start_col : end_col + 1]))
+        while rows and not any(str(cell).strip() for cell in rows[-1]):
+            rows.pop()  # o Sheets não devolve as linhas vazias do fim
+        return FakeCall({"values": rows} if rows else {})
 
     def update(self, **kwargs: Any) -> FakeCall:
         self.updates.append(kwargs)
+        self._write(kwargs["range"], kwargs["body"]["values"])
         return FakeCall({})
+
+    def batchUpdate(self, **kwargs: Any) -> FakeCall:  # noqa: N802 (nome da API)
+        self.batch_updates.append(kwargs)
+        total = 0
+        for item in kwargs["body"]["data"]:
+            total += self._write(item["range"], item["values"])
+        return FakeCall({"totalUpdatedRows": total})
+
+    def append(self, **kwargs: Any) -> FakeCall:
+        self.appends.append(kwargs)
+        rows = kwargs["body"]["values"]
+        first = max(self._last_filled_row() + 1, 2)
+        self._write("'" + DERIVED + "'!A" + str(first), rows)
+        last = first + len(rows) - 1
+        updated_range = "'" + DERIVED + "'!A" + str(first) + ":V" + str(last)
+        return FakeCall(
+            {"updates": {"updatedRows": len(rows), "updatedRange": updated_range}}
+        )
 
 
 class FakeSpreadsheets:
@@ -178,9 +276,17 @@ class FakeSpreadsheets:
     def batchUpdate(self, **kwargs: Any) -> FakeCall:  # noqa: N802 (nome da API)
         self.batch_updates.append(kwargs)
         for request in kwargs["body"]["requests"]:
+            assert "deleteDimension" not in request, "jamais apagar linhas"
+            assert "deleteRange" not in request, "jamais apagar células"
+            assert "deleteSheet" not in request, "jamais apagar a aba"
             if "addSheet" in request:  # simula a criação: passa a existir
                 self._sheets.append(
-                    {"properties": {"sheetId": 999, "title": request["addSheet"]["properties"]["title"]}}
+                    {
+                        "properties": {
+                            "sheetId": 999,
+                            "title": request["addSheet"]["properties"]["title"],
+                        }
+                    }
                 )
         return FakeCall({})
 
@@ -196,23 +302,6 @@ class FakeService:
         return self._spreadsheets
 
 
-def make_writer(sheets: list[dict[str, Any]], config: Any = None) -> tuple[DerivedSheetWriter, FakeSpreadsheets, FakeValues]:
-    """DerivedSheetWriter sem rede nem credencial real."""
-    values = FakeValues()
-    spreadsheets = FakeSpreadsheets(sheets, values)
-    writer = object.__new__(DerivedSheetWriter)
-    writer._config = config or make_config()
-    writer._credentials = type("C", (), {"service_account_email": SERVICE_ACCOUNT["client_email"]})()
-    writer._service = FakeService(spreadsheets)
-    writer._spreadsheets = spreadsheets
-    writer._values = values
-    return writer, spreadsheets, values
-
-
-DERIVED = "Meta ADS - Métricas"
-RAW = "Meta ADS"
-
-
 def existing_sheets() -> list[dict[str, Any]]:
     return [
         {"properties": {"sheetId": 0, "title": RAW}},
@@ -220,14 +309,195 @@ def existing_sheets() -> list[dict[str, Any]]:
     ]
 
 
+def make_writer(
+    sheets: list[dict[str, Any]] | None = None,
+    grid: list[list[Any]] | None = None,
+    config: Any = None,
+) -> tuple[DerivedSheetWriter, FakeSpreadsheets, FakeValues]:
+    """DerivedSheetWriter sem rede nem credencial real."""
+    values = FakeValues(grid)
+    spreadsheets = FakeSpreadsheets(
+        existing_sheets() if sheets is None else sheets, values
+    )
+    writer = object.__new__(DerivedSheetWriter)
+    writer._config = config or make_config()
+    writer._credentials = type(
+        "C", (), {"service_account_email": SERVICE_ACCOUNT["client_email"]}
+    )()
+    writer._service = FakeService(spreadsheets)
+    writer._spreadsheets = spreadsheets
+    writer._values = values
+    return writer, spreadsheets, values
+
+
+def populated_grid() -> list[list[Any]]:
+    """Aba com cabeçalho e três dias de histórico já gravados."""
+    return [
+        list(HEADER),                                  # linha 1
+        derived_row("2026-01-02", "ad1", spend=5.0),   # linha 2
+        derived_row("2026-01-03", "ad1", spend=6.0),   # linha 3
+        derived_row("2026-07-13", "ad1", spend=7.0),   # linha 4
+    ]
+
+
+# -- A garantia central: nada é apagado -----------------------------------
+
+
+def test_a_aba_nunca_e_limpa() -> None:
+    """values.clear explode no dublê; passar significa que ninguém o chamou."""
+    writer, _, values = make_writer(grid=populated_grid())
+
+    writer.upsert([make_raw(date="2026-07-14", ad_id="ad1", spend=9.0)])
+
+    assert values.clears == []
+
+
+def test_historico_fora_da_janela_e_preservado_intacto() -> None:
+    """As linhas de janeiro não vieram na coleta e não podem ser tocadas."""
+    writer, _, values = make_writer(grid=populated_grid())
+    antes = [list(values.grid[1]), list(values.grid[2])]
+
+    writer.upsert(
+        [
+            make_raw(date="2026-07-13", ad_id="ad1", spend=70.0),
+            make_raw(date="2026-07-14", ad_id="ad1", spend=80.0),
+        ]
+    )
+
+    assert values.grid[1] == antes[0], "a linha de 2026-01-02 foi alterada"
+    assert values.grid[2] == antes[1], "a linha de 2026-01-03 foi alterada"
+    assert len(values.grid) == 5, "histórico preservado + 1 linha nova"
+
+
+def test_nenhum_range_de_escrita_alcanca_linha_fora_da_coleta() -> None:
+    """Todo range escrito aponta para uma linha que a coleta atual trouxe."""
+    writer, _, values = make_writer(grid=populated_grid())
+
+    writer.upsert([make_raw(date="2026-07-13", ad_id="ad1", spend=70.0)])
+
+    escritos = [
+        item["range"] for lote in values.batch_updates for item in lote["body"]["data"]
+    ]
+    assert escritos == ["'" + DERIVED + "'!A4:V4"], "só a linha de 2026-07-13"
+    assert values.appends == [], "nada novo a inserir"
+
+
+# -- Update x append -------------------------------------------------------
+
+
+def test_chave_existente_e_atualizada_no_lugar() -> None:
+    writer, _, values = make_writer(grid=populated_grid())
+
+    summary = writer.upsert([make_raw(date="2026-07-13", ad_id="ad1", spend=70.0)])
+
+    assert (summary.updated, summary.appended) == (1, 0)
+    assert values.grid[3][0] == "2026-07-13"  # continua na linha 4
+    assert values.grid[3][5] == 70.0          # Spend atualizado
+    assert len(values.grid) == 4              # nenhuma linha criada
+
+
+def test_chave_nova_vai_para_o_fim() -> None:
+    writer, _, values = make_writer(grid=populated_grid())
+
+    summary = writer.upsert([make_raw(date="2026-07-14", ad_id="ad9", spend=3.0)])
+
+    assert (summary.updated, summary.appended) == (0, 1)
+    assert values.grid[4][0] == "2026-07-14"
+    assert values.grid[4][4] == "ad9"
+    assert values.appends[0]["insertDataOption"] == "INSERT_ROWS"
+
+
+def test_mistura_de_update_e_append_no_mesmo_lote() -> None:
+    writer, _, values = make_writer(grid=populated_grid())
+
+    summary = writer.upsert(
+        [
+            make_raw(date="2026-07-13", ad_id="ad1", spend=70.0),  # já existe
+            make_raw(date="2026-07-13", ad_id="ad2", spend=20.0),  # novo
+            make_raw(date="2026-07-14", ad_id="ad1", spend=30.0),  # novo
+        ]
+    )
+
+    assert (summary.updated, summary.appended, summary.rows) == (1, 2, 3)
+    assert len(values.grid) == 6  # 4 linhas + 2 acréscimos
+
+
+def test_mesma_chave_duas_vezes_no_lote_nao_duplica() -> None:
+    writer, _, values = make_writer(grid=populated_grid())
+
+    summary = writer.upsert(
+        [
+            make_raw(date="2026-07-14", ad_id="ad1", spend=1.0),
+            make_raw(date="2026-07-14", ad_id="ad1", spend=2.0),  # a última vence
+        ]
+    )
+
+    assert (summary.rows, summary.appended) == (1, 1)
+    assert values.grid[4][5] == 2.0
+
+
+def test_data_gravada_como_serial_ainda_casa_a_chave() -> None:
+    """Gravada com USER_ENTERED, a data volta da planilha como número de série."""
+    grid = populated_grid()
+    grid[3][0] = 46216  # 2026-07-13 em serial do Sheets
+    writer, _, values = make_writer(grid=grid)
+
+    summary = writer.upsert([make_raw(date="2026-07-13", ad_id="ad1", spend=70.0)])
+
+    assert (summary.updated, summary.appended) == (1, 0), "o serial tem de casar"
+    assert len(values.grid) == 4
+
+
+def test_execucao_repetida_e_idempotente() -> None:
+    writer, _, values = make_writer(grid=populated_grid())
+    lote = [make_raw(date="2026-07-14", ad_id="ad1", spend=9.0)]
+
+    writer.upsert(lote)
+    altura = len(values.grid)
+    writer.upsert(lote)
+
+    assert len(values.grid) == altura, "a 2ª execução não pode criar linha nova"
+
+
+def test_aba_vazia_recebe_cabecalho_e_dados() -> None:
+    writer, _, values = make_writer(grid=[])
+
+    writer.upsert([make_raw(date="2026-07-13", ad_id="ad1")])
+
+    assert values.grid[0] == list(HEADER)
+    assert values.grid[1][4] == "ad1"
+
+
+def test_cabecalho_existente_nao_e_reescrito() -> None:
+    writer, _, values = make_writer(grid=populated_grid())
+
+    writer.upsert([make_raw(date="2026-07-13", ad_id="ad1")])
+
+    assert values.updates == [], "o cabeçalho já estava lá; não reescrever"
+
+
+# -- Isolamento e estrutura ------------------------------------------------
+
+
 def test_escreve_apenas_na_aba_derivada() -> None:
     """Nenhum range de valor e nenhum sheetId estrutural aponta para a aba bruta."""
-    writer, spreadsheets, values = make_writer(existing_sheets())
+    writer, spreadsheets, values = make_writer(grid=populated_grid())
 
-    writer.rebuild([make_raw(spend=10.0, impressions=100, link_clicks=5)])
+    writer.upsert(
+        [
+            make_raw(date="2026-07-13", ad_id="ad1", spend=10.0),
+            make_raw(date="2026-07-20", ad_id="ad5", spend=10.0),
+        ]
+    )
 
-    assert values.clears[0]["range"] == f"'{DERIVED}'"
-    assert values.updates[0]["range"] == f"'{DERIVED}'!A1"
+    ranges = (
+        [item["range"] for lote in values.batch_updates for item in lote["body"]["data"]]
+        + [update["range"] for update in values.updates]
+        + [append["range"] for append in values.appends]
+    )
+    assert ranges, "o teste precisa ter exercitado alguma escrita"
+    for range_ in ranges:
+        assert range_.startswith("'" + DERIVED + "'!"), "escrita fora da derivada"
 
     for update in spreadsheets.batch_updates:
         for request in update["body"]["requests"]:
@@ -237,39 +507,33 @@ def test_escreve_apenas_na_aba_derivada() -> None:
 
 
 def test_cria_a_aba_se_nao_existir() -> None:
-    writer, spreadsheets, _ = make_writer([{"properties": {"sheetId": 0, "title": RAW}}])
+    writer, spreadsheets, values = make_writer(
+        sheets=[{"properties": {"sheetId": 0, "title": RAW}}], grid=[]
+    )
 
-    summary = writer.rebuild([make_raw()])
+    summary = writer.upsert([make_raw()])
 
     assert summary.created_sheet is True
     add = spreadsheets.batch_updates[0]["body"]["requests"][0]["addSheet"]
     assert add["properties"]["title"] == DERIVED
+    assert values.grid[0] == list(HEADER)
 
 
-def test_aba_existente_e_limpa_e_reescrita_com_cabecalho() -> None:
-    writer, _, values = make_writer(existing_sheets())
+def test_formatos_cobrem_todo_o_historico_e_poupam_o_cabecalho() -> None:
+    writer, spreadsheets, _ = make_writer(grid=populated_grid())
 
-    writer.rebuild([make_raw(ad_id="ad1"), make_raw(ad_id="ad2")])
-
-    assert len(values.clears) == 1
-    escrito = values.updates[0]["body"]["values"]
-    assert escrito[0] == list(HEADER)   # linha 1 é o cabeçalho
-    assert len(escrito) == 3            # cabeçalho + 2 linhas
-    assert values.updates[0]["valueInputOption"] == "USER_ENTERED"
-
-
-def test_formatos_de_numero_aplicados_nas_colunas_certas() -> None:
-    writer, spreadsheets, _ = make_writer(existing_sheets())
-
-    writer.rebuild([make_raw()])
+    writer.upsert([make_raw(date="2026-07-14", ad_id="ad1")])  # vira a linha 5
 
     formatos: dict[int, str] = {}
     for update in spreadsheets.batch_updates:
         for request in update["body"]["requests"]:
             rng = request["repeatCell"]["range"]
-            pattern = request["repeatCell"]["cell"]["userEnteredFormat"]["numberFormat"]["pattern"]
-            formatos[rng["startColumnIndex"]] = pattern
-            assert rng["startRowIndex"] == 1, "o cabeçalho não pode ser formatado como número"
+            cell = request["repeatCell"]["cell"]
+            formatos[rng["startColumnIndex"]] = cell["userEnteredFormat"]["numberFormat"][
+                "pattern"
+            ]
+            assert rng["startRowIndex"] == 1, "o cabeçalho não é número"
+            assert rng["endRowIndex"] == 5, "o formato deve cobrir o histórico inteiro"
 
     assert formatos[0] == "yyyy-mm-dd"   # Date
     assert formatos[8] == "0.00%"        # CTR
@@ -280,18 +544,20 @@ def test_formatos_de_numero_aplicados_nas_colunas_certas() -> None:
 
 
 def test_dry_run_nao_toca_na_planilha() -> None:
-    writer, spreadsheets, values = make_writer(existing_sheets(), make_config(dry_run=True))
+    writer, spreadsheets, values = make_writer(
+        grid=populated_grid(), config=make_config(dry_run=True)
+    )
 
-    summary = writer.rebuild([make_raw(), make_raw(ad_id="ad2")])
+    summary = writer.upsert([make_raw(), make_raw(ad_id="ad2")])
 
     assert (summary.rows, summary.dry_run) == (2, True)
-    assert values.clears == [] and values.updates == []
+    assert values.updates == [] and values.batch_updates == [] and values.appends == []
     assert spreadsheets.batch_updates == []
     assert spreadsheets.gets == 0, "DRY_RUN nem deve consultar a estrutura"
 
 
 def test_derivada_igual_a_bruta_e_recusada() -> None:
-    """A guarda que impede apagar o histórico por configuração errada."""
+    """A guarda que impede escrever linhas derivadas por cima da aba bruta."""
     config = make_config(derived_sheet_name="Meta ADS", raw_sheet_name="Meta ADS")
 
     with pytest.raises(SheetWriterError, match="destruiria o histórico"):
