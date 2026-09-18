@@ -3,13 +3,16 @@ name: Coleta diária Meta ADS
 on:
   schedule:
     # O cron do GitHub Actions é SEMPRE em UTC — não existe configuração de fuso.
-    # 09:00 UTC = 06:00 em São Paulo (UTC-3). O Brasil não adota mais horário de
-    # verão desde 2019, então o offset é fixo o ano inteiro; se voltar a adotar,
-    # este horário vira 07:00 local no verão e precisa virar '0 8 * * *'.
+    # Queremos rodar de MADRUGADA no horário de Brasília:
+    #   06:00 UTC = 03:00 em São Paulo (UTC-3).
+    # Para converter: horário de Brasília + 3 = horário UTC que vai aqui no cron.
+    # O Brasil não adota mais horário de verão desde 2019, então o offset é fixo
+    # o ano inteiro; se voltar a adotar (UTC-2), 06:00 UTC vira 04:00 local no
+    # verão e este cron precisa virar '0 5 * * *' para continuar às 03:00.
     # O agendamento do GitHub não é pontual: a execução costuma atrasar alguns
     # minutos (mais em horário de pico). Como a janela vai só até ontem, atraso
     # não afeta o resultado.
-    - cron: '0 9 * * *'
+    - cron: '0 6 * * *'
 
   # Disparo manual, para testar antes de confiar no agendamento.
   workflow_dispatch:
